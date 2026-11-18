@@ -29,6 +29,8 @@ set -euo pipefail
 
 LOCATION="${LOCATION:-uksouth}"
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-tf-drift-detection}"
+# Must match defaults.blob_container in repos.json - the orchestrator passes that
+# value to every caller, and a mismatch fails at upload time with a 404.
 CONTAINER_NAME="${CONTAINER_NAME:-drift-reports}"
 APP_NAME="${APP_NAME:-gh-tf-drift-detection}"
 RETENTION_DAYS="${RETENTION_DAYS:-90}"

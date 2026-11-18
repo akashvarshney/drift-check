@@ -23,7 +23,8 @@ See [docs/architecture.md](docs/architecture.md) for the Mermaid diagrams.
 | `repos.json` | Central inventory: repositories, workflows, environments, defaults |
 | `.github/workflows/drift-orchestrator.yml` | Cron + manual sweep; builds the matrix and dispatches |
 | `.github/workflows/reusable-drift-check.yml` | All drift logic: plan, filter, upload (called by targets) |
-| `scripts/dispatch-drift-check.sh` | REST `workflow_dispatch` helper: preflight, retry, clear errors |
+| `scripts/dispatch-drift-check.sh` | REST `workflow_dispatch` helper: preflight, retry, run correlation, clear errors |
+| `scripts/await-drift-runs.sh` | Polls every dispatched run and fails the sweep when one did not finish green |
 | `examples/target-repo-caller.yml` | Copy into each Terraform repo as `.github/workflows/terraform-drift-check.yml` |
 | `examples/standalone-drift-job.yml` | Self-contained fallback when cross-repo reuse is not possible |
 | `azure/setup.sh` | Azure CLI bootstrap (storage, container, app registration, federation, RBAC) |
@@ -38,14 +39,26 @@ See [docs/architecture.md](docs/architecture.md) for the Mermaid diagrams.
    optional `repository_filter` regex and `dry_run` toggle.
 2. **Prepare** — `repos.json` is validated and flattened with `jq` into one
    matrix row per environment: `{repo, ref, workflow_file, workflow_label,
-   environment, working_directory, terraform_version}`.
+   environment, working_directory, terraform_version, blob_container}`. The
+   container comes from `defaults.blob_container`, with an optional
+   `workflows[].blob_container` override.
 3. **Dispatch** — one job per row, `max-parallel` from `defaults.max_parallel`
    (clamped to 1–10), `fail-fast: false`. Each job preflights the workflow file,
-   then `POST`s to the dispatches endpoint on the **default branch**.
-4. **Drift check** — the target caller invokes the reusable workflow, which logs
+   then `POST`s to the dispatches endpoint on the **default branch**, sending
+   the report container and a unique correlation id.
+4. **Correlate** — `workflow_dispatch` returns no run id, so the dispatch job
+   finds the run it created: the caller stamps the correlation id into its
+   `run-name`, and the job waits for the matching run, then records its id and
+   URL as a build artifact.
+5. **Verify** — one job polls every recorded run to completion. A target run
+   that ends with any conclusion other than `success`, a dispatch whose run was
+   never identified, or a missing record fails the sweep, so green means every
+   plan really ran green. Wall-clock budget: `MAX_WAIT_SECONDS` (default 3600,
+   override with the repository variable `DRIFT_VERIFY_TIMEOUT_SECONDS`).
+6. **Drift check** — the target caller invokes the reusable workflow, which logs
    in to Azure with OIDC, runs `terraform init` and
    `terraform plan -detailed-exitcode -out=tfplan.binary`.
-5. **Branch** — exit code decides what happens:
+7. **Branch** — exit code decides what happens:
 
 | Exit code | Meaning | Orchestrator/target result | Upload |
 | --- | --- | --- | --- |
@@ -53,15 +66,19 @@ See [docs/architecture.md](docs/architecture.md) for the Mermaid diagrams.
 | `1` | Terraform error | **red** (alerting) | plan log artifact (7 days) |
 | `2` | Drift detected | green | `drift-report.json` → Blob Storage |
 
-6. **Report** — `terraform show -json tfplan.binary` → `jq` drops `no-op` and
+8. **Report** — `terraform show -json tfplan.binary` → `jq` drops `no-op` and
    `read` actions, keeps every real change, wraps it with metadata.
 
 Blob path:
 
 ```
-drift-reports/YYYY-MM-DD/<owner>__<repo>-<workflow_label>-<environment>.json
-# e.g. drift-reports/2026-11-18/acme-corp__infra-network-network-prod.json
+<container>/drift-reports/YYYY-MM-DD/<owner>__<repo>-<workflow_label>-<environment>.json
+# e.g. drift-reports/drift-reports/2026-11-18/acme-corp__infra-network-network-prod.json
 ```
+
+`<container>` is `defaults.blob_container` from `repos.json` (or a
+`workflows[].blob_container` override), passed to the caller as an input. Keep
+it equal to the container `azure/setup.sh` created.
 
 Report shape:
 
@@ -165,7 +182,8 @@ through `secrets: inherit`.
 fine-grained PAT:
 
 - **Repository access:** the target repositories (or all repos in the org)
-- **Permissions:** `Actions: Read and write`, `Contents: Read`, `Metadata: Read`
+- **Permissions:** `Actions: Read and write` (read is used by the verify job to
+  poll run status), `Contents: Read`, `Metadata: Read`
 - **Expiry:** 90 days or less, and calendar a rotation
 
 Store it in **this** repository as the secret `ORCHESTRATOR_TOKEN`.
@@ -222,6 +240,8 @@ Then set `GH_TOKEN: ${{ steps.app-token.outputs.token }}` on the dispatch step.
 | `workflows[].label` | no | short name used in job titles and blob names |
 | `workflows[].working_directory` | no | Terraform dir; `{environment}` is substituted at run time |
 | `workflows[].terraform_version` | no | falls back to `defaults.terraform_version` |
+| `defaults.blob_container` | no | Azure container for reports, default `drift-reports`; passed to every caller |
+| `workflows[].blob_container` | no | overrides `defaults.blob_container` for this workflow |
 | `workflows[].environments` | yes | each becomes one matrix row |
 | `workflows[].disabled` | no | `true` pauses just that workflow |
 
@@ -303,7 +323,11 @@ Terraform manages, re-run, and expect a green target run plus a new blob.
 | Dispatch step: `404` | Caller file missing on the default branch, or the file name in `repos.json` is wrong. |
 | Dispatch step: `422` | The caller does not declare an input the orchestrator sends, or Actions is disabled on the repo. |
 | `Matrix vector ... does not contain any values` | Should be impossible (guarded by the `count` output); if it appears, every repo was filtered out or disabled. |
-| Target run red with `Terraform plan failed (exit 1)` | Real Terraform error — download the `terraform-plan-log-<env>` artifact. |
+| Target run red with `Terraform plan failed (exit 1)` | Real Terraform error — download the `terraform-plan-log-<env>` artifact. The sweep is red too, via the verify job. |
+| `Dispatched run not found` on the dispatch step | The caller does not declare the `correlation_id` input or has no `run-name`. Copy the current `examples/target-repo-caller.yml`. |
+| `Ambiguous dispatch` on the dispatch step | The same workflow was dispatched several times on one branch without correlation ids. Adopt the current caller template. |
+| Verify job: `Invalid blob container` | `defaults.blob_container` / `workflows[].blob_container` is not a valid Azure container name (3–63 lowercase letters, digits, hyphens). |
+| Verify job: `Drift check did not pass` | A target run ended red (or timed out, or was unverified). Follow the run link in the verify job summary. |
 | Green target run, no blob | Exit code was `0` (no drift) — check the run's step summary. |
 | Warning `exit code 2 without resource drift` | The plan reported changes but only outputs / data sources changed; the report is uploaded with null/empty arrays. |
 
@@ -331,6 +355,7 @@ Terraform manages, re-run, and expect a green target run plus a new blob.
 
 ## Phase 1 boundary
 
-Included: scheduling, fan-out, dispatch, drift detection, filtering, storage.
+Included: scheduling, fan-out, dispatch, run correlation, verification of
+every dispatched run, drift detection, filtering, storage.
 Not included (Phase 2): Event Grid subscription, AI analysis, Teams
 notification, historical comparison, drift dashboards.

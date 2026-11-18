@@ -8,9 +8,17 @@ name: Terraform Drift Check
 # the repository's DEFAULT branch. All real logic lives in the reusable
 # workflow in the orchestrator repo, so this file stays a thin adapter.
 #
+# `run-name` embeds the orchestrator's correlation id. `workflow_dispatch`
+# returns no run id, so this is how the sweep finds the exact run it triggered
+# and verifies that it finished green.
+#
 # Declare every input exactly as below - the orchestrator sends all of them,
 # and workflow_dispatch rejects (422) any input that is not declared here.
 # -----------------------------------------------------------------------------
+
+run-name: >-
+  drift ${{ inputs.workflow_label || 'workflow' }}/${{ inputs.environment }} ${{
+  inputs.correlation_id && format('[{0}]', inputs.correlation_id) || '' }}
 
 on:
   workflow_dispatch:
@@ -39,6 +47,14 @@ on:
         description: "Set by the central orchestrator for traceability"
         type: string
         default: ""
+      blob_container:
+        description: "Azure Blob Storage container (defaults.blob_container in repos.json)"
+        type: string
+        default: "drift-reports"
+      correlation_id:
+        description: "Unique id stamped into run-name so the sweep can verify this run"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -55,7 +71,7 @@ jobs:
       terraform_version: ${{ inputs.terraform_version }}
       workflow_label: ${{ inputs.workflow_label }}
       orchestrator_run_url: ${{ inputs.orchestrator_run_url }}
-      blob_container: drift-reports
+      blob_container: ${{ inputs.blob_container }}
       blob_prefix: drift-reports
     # Picks up the org-level AZURE_* secrets without listing them here.
     secrets: inherit

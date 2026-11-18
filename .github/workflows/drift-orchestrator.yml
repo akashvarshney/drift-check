@@ -6,7 +6,12 @@ name: Terraform Drift Orchestrator
 #   1. prepare  : validate repos.json and flatten it into a dispatch matrix
 #   2. dispatch : one parallel job per (repository x workflow x environment),
 #                 rate limited by strategy.max-parallel, calling the GitHub REST
-#                 API `workflow_dispatch` endpoint on the DEFAULT BRANCH.
+#                 API `workflow_dispatch` endpoint on the DEFAULT BRANCH. The
+#                 created run is correlated and recorded as an artifact.
+#   3. verify   : polls every dispatched run to completion. A target run that
+#                 failed (terraform error) or could not be identified fails the
+#                 sweep, so a green sweep means every plan really ran green.
+#   4. report   : summary table, always runs.
 #
 # Authentication: a fine-grained PAT (or GitHub App installation token) stored
 # as the ORCHESTRATOR_TOKEN secret. GITHUB_TOKEN cannot dispatch workflows in
@@ -67,6 +72,9 @@ jobs:
           set -euo pipefail
           jq -e . "$CONFIG_FILE" > /dev/null
           jq -e '
+            def valid_container:
+              type == "string" and test("^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$");
+
             (.repositories | type) == "array"
             and (.repositories | length) > 0
             and ([.repositories[] | select((.repo // "") == "")] | length) == 0
@@ -74,8 +82,11 @@ jobs:
                   | select(.enabled != false)
                   | select(((.workflows // []) | length) == 0)] | length) == 0
             and ([.repositories[] | (.workflows // [])[] | select((.file // "") == "")] | length) == 0
+            and ([.defaults.blob_container? | select(. != null) | select(valid_container | not)] | length) == 0
+            and ([.repositories[]? | (.workflows // [])[] | .blob_container? | select(. != null)
+                  | select(valid_container | not)] | length) == 0
           ' "$CONFIG_FILE" > /dev/null || {
-            echo "::error file=repos.json::repos.json failed validation - every entry needs a repo, and every enabled repo needs at least one workflow with a file."
+            echo "::error file=repos.json::repos.json failed validation - every entry needs a repo, every enabled repo needs at least one workflow with a file, and any blob_container must be a valid Azure container name (3-63 lowercase letters, digits or hyphens)."
             exit 1
           }
 
@@ -89,6 +100,7 @@ jobs:
             . as $root
             | ($root.defaults.default_branch // "main") as $fallback_branch
             | ($root.defaults.terraform_version // "1.9.8") as $fallback_tf
+            | ($root.defaults.blob_container // "drift-reports") as $fallback_container
             | [
                 $root.repositories[]?
                 | select(.enabled != false)
@@ -96,6 +108,7 @@ jobs:
                 | ($repo_entry.workflows // [])[]
                 | select(.disabled != true)
                 | . as $workflow
+                | ($workflow.blob_container // $fallback_container) as $container
                 | ($workflow.environments // [])[]
                 | select(type == "string" and length > 0)
                 | {
@@ -105,7 +118,8 @@ jobs:
                     workflow_label: ($workflow.label // ($workflow.file | gsub("\\.ya?ml$"; ""))),
                     environment: .,
                     working_directory: ($workflow.working_directory // "."),
-                    terraform_version: ($workflow.terraform_version // $fallback_tf)
+                    terraform_version: ($workflow.terraform_version // $fallback_tf),
+                    blob_container: $container
                   }
               ]
             # Dedupe on the label, not the file name: two workflows in the same
@@ -149,6 +163,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read # artifact upload for the run info hand-off
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
@@ -174,13 +189,71 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
           WORKING_DIRECTORY: ${{ matrix.working_directory }}
           TERRAFORM_VERSION: ${{ matrix.terraform_version }}
+          BLOB_CONTAINER: ${{ matrix.blob_container }}
+          # Unique per dispatch: the caller stamps it into its run-name, which
+          # is how `verify` finds exactly this run again.
+          CORRELATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
           ORCHESTRATOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: bash scripts/dispatch-drift-check.sh
 
+      - name: Upload dispatched run info
+        # Runs even when the dispatch step failed: the verify job distinguishes
+        # "run failed" from "run never identified" from the recorded data.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-run-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/run-info/*.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+  verify:
+    name: Verify dispatched runs
+    needs: [prepare, dispatch]
+    # Verification is the point of the sweep: poll every dispatched run instead
+    # of trusting that the dispatch was accepted.
+    if: ${{ always() && !inputs.dry_run && needs.prepare.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    # Covers MAX_WAIT_SECONDS (default 3600) plus scheduling overhead.
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    steps:
+      - name: Check out verification helper
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: Download dispatched run info
+        # A failed dispatch leaves no artifact; the script reports that with a
+        # better message than this action would.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: drift-run-*
+          path: ${{ runner.temp }}/runs
+          merge-multiple: true
+
+      - name: Poll dispatched runs
+        env:
+          # Fine-grained PAT with "Actions: read" on every target repository.
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          RUNS_DIR: ${{ runner.temp }}/runs
+          EXPECTED: ${{ needs.prepare.outputs.count }}
+          DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          # Override with a repository/org variable if plans legitimately run
+          # longer than an hour.
+          MAX_WAIT_SECONDS: ${{ vars.DRIFT_VERIFY_TIMEOUT_SECONDS || '3600' }}
+          POLL_INTERVAL_SECONDS: "20"
+        run: bash scripts/await-drift-runs.sh
+
   report:
     name: Sweep summary
-    needs: [prepare, dispatch]
+    needs: [prepare, dispatch, verify]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -190,6 +263,7 @@ jobs:
         env:
           TARGETS: ${{ needs.prepare.outputs.count }}
           DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
           ORCHESTRATOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -200,8 +274,11 @@ jobs:
             echo "| --- | --- |"
             echo "| Dispatch targets | ${TARGETS:-0} |"
             echo "| Dispatch job result | ${DISPATCH_RESULT:-skipped} |"
+            echo "| Verification job result | ${VERIFY_RESULT:-skipped} |"
             echo "| Orchestrator run | ${ORCHESTRATOR_RUN_URL} |"
             echo
-            echo "Drift reports land in Azure Blob Storage under \`drift-reports/YYYY-MM-DD/\`."
-            echo "Target-repo run links are listed in each dispatch job log."
+            echo "Drift reports land in Azure Blob Storage under \`<container>/drift-reports/YYYY-MM-DD/\`;"
+            echo "the container comes from \`defaults.blob_container\` in \`repos.json\`."
+            echo "A green sweep means every dispatched target run finished green -"
+            echo "see the \`Verify dispatched runs\` job for the per-target table."
           } >> "$GITHUB_STEP_SUMMARY"
