@@ -25,7 +25,6 @@ See [docs/architecture.md](docs/architecture.md) for the flow diagram.
 | `scripts/await-drift-runs.sh` | Polls every dispatched run; fails the sweep if one did not finish green |
 | `examples/landingzone-infra-deploy.yml` | Your deploy pipeline with the two drift changes applied — copy over the original |
 | `docs/architecture.md` | Flow + sequence diagrams |
-| `azure/` | **Not needed** for this design. Kept only if you later want a dedicated drift storage account instead of reusing the state account |
 
 ---
 
@@ -322,5 +321,4 @@ copes.
 
 Included: scheduling, fan-out, dispatch of existing pipelines, run
 verification, drift detection via exit code, `jq` filtering, blob storage.
-Not included (Phase 2): Event Grid subscription, AI analysis, Teams
-notification, historical comparison, dashboards.
+Nothing beyond that is built or wired in this repo.

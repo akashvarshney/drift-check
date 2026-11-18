@@ -40,12 +40,6 @@ flowchart TD
     JQ --> META["Wrap with metadata<br/>repo, workflow, environment, timestamp, run_url"]
     META --> BLOB[("Blob storage in the state account<br/>&lt;DRIFT_CONTAINER&gt;/drift-reports/YYYY-MM-DD/<br/>owner__repo-landingzone-azresource-env.json")]
 
-    BLOB -.-> P2
-
-    subgraph P2["Phase 2 - placeholder, not built in Phase 1"]
-        direction TB
-        EG["Event Grid<br/>BlobCreated"] -.-> AI["AI analysis"] -.-> TEAMS["Microsoft Teams notification"]
-    end
 ```
 
 ## Dispatch and verification sequence
@@ -94,7 +88,7 @@ sequenceDiagram
   in the storage account the target already discovers (`sttfst`), created
   idempotently on first drift. No new app registration, no new secrets, no new
   role assignment; the plan step's existing OIDC session is reused for the
-  upload. `azure/setup.sh` (dedicated account) is therefore optional.
+  upload. There is no separate dedicated drift account.
 - **`azresource` is the per-stack discriminator.** Each value has its own
   `ROOT_PATH=infra/<azresource>`, var-file and state key
   (`tfstate-infra-<azresource>`), so each is a separate drift target and gets
