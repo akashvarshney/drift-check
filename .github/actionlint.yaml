@@ -1,0 +1,9 @@
+# actionlint configuration.
+#
+# The landing-zone pipeline runs on a labelled self-hosted runner, which
+# actionlint cannot know about. Declaring the label here keeps
+# `actionlint examples/landingzone-infra-deploy.yml` clean instead of failing
+# on a label that is perfectly valid in that organisation.
+self-hosted-runner:
+  labels:
+    - pda-self-hosted-linux

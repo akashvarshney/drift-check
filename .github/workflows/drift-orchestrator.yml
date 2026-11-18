@@ -4,10 +4,11 @@ name: Terraform Drift Orchestrator
 # Phase 1 orchestrator.
 #
 #   1. prepare  : validate repos.json and flatten it into a dispatch matrix
-#   2. dispatch : one parallel job per (repository x workflow x environment),
-#                 rate limited by strategy.max-parallel, calling the GitHub REST
-#                 API `workflow_dispatch` endpoint on the DEFAULT BRANCH. The
-#                 created run is correlated and recorded as an artifact.
+#   2. dispatch : one job per target, calling the GitHub REST API
+#                 `workflow_dispatch` endpoint on the target's DEFAULT BRANCH,
+#                 on the workflow that already exists there. No caller
+#                 workflow, no reusable workflow, no changes to how that
+#                 pipeline authenticates or runs terraform.
 #   3. verify   : polls every dispatched run to completion. A target run that
 #                 failed (terraform error) or could not be identified fails the
 #                 sweep, so a green sweep means every plan really ran green.
@@ -25,7 +26,7 @@ on:
   workflow_dispatch:
     inputs:
       repository_filter:
-        description: "Optional regex - only dispatch repositories whose owner/name matches (e.g. ^acme-corp/infra-)"
+        description: "Optional regex - only dispatch repositories whose owner/name matches (e.g. ^acme-corp/)"
         type: string
         required: false
         default: ""
@@ -72,8 +73,7 @@ jobs:
           set -euo pipefail
           jq -e . "$CONFIG_FILE" > /dev/null
           jq -e '
-            def valid_container:
-              type == "string" and test("^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$");
+            def nonempty_string: type == "string" and length > 0;
 
             (.repositories | type) == "array"
             and (.repositories | length) > 0
@@ -82,11 +82,16 @@ jobs:
                   | select(.enabled != false)
                   | select(((.workflows // []) | length) == 0)] | length) == 0
             and ([.repositories[] | (.workflows // [])[] | select((.file // "") == "")] | length) == 0
-            and ([.defaults.blob_container? | select(. != null) | select(valid_container | not)] | length) == 0
-            and ([.repositories[]? | (.workflows // [])[] | .blob_container? | select(. != null)
-                  | select(valid_container | not)] | length) == 0
+            and ([.repositories[]
+                  | select(.enabled != false)
+                  | (.workflows // [])[]
+                  | select(.disabled != true)
+                  | select(((.targets // []) | length) == 0)] | length) == 0
+            and ([.repositories[] | (.workflows // [])[] | (.targets // [])[]
+                  | select((.dispatch_inputs | type) != "object"
+                           or (((.dispatch_inputs.environment // "") | nonempty_string) | not))] | length) == 0
           ' "$CONFIG_FILE" > /dev/null || {
-            echo "::error file=repos.json::repos.json failed validation - every entry needs a repo, every enabled repo needs at least one workflow with a file, and any blob_container must be a valid Azure container name (3-63 lowercase letters, digits or hyphens)."
+            echo "::error file=repos.json::repos.json failed validation - every entry needs a repo, every enabled repo needs at least one workflow with a file, every enabled workflow needs at least one target, and every target needs dispatch_inputs with a non-empty environment."
             exit 1
           }
 
@@ -96,11 +101,11 @@ jobs:
           REPOSITORY_FILTER: ${{ inputs.repository_filter }}
         run: |
           set -euo pipefail
-          matrix=$(jq -c --arg filter "${REPOSITORY_FILTER}" '
+          # One row per target. dispatch_inputs is passed to workflow_dispatch
+          # verbatim, so what repos.json says is exactly what the target gets.
+          matrix=$(jq -c --arg filter "${REPOSITORY_FILTER:-}" '
             . as $root
             | ($root.defaults.default_branch // "main") as $fallback_branch
-            | ($root.defaults.terraform_version // "1.9.8") as $fallback_tf
-            | ($root.defaults.blob_container // "drift-reports") as $fallback_container
             | [
                 $root.repositories[]?
                 | select(.enabled != false)
@@ -108,33 +113,28 @@ jobs:
                 | ($repo_entry.workflows // [])[]
                 | select(.disabled != true)
                 | . as $workflow
-                | ($workflow.blob_container // $fallback_container) as $container
-                | ($workflow.environments // [])[]
-                | select(type == "string" and length > 0)
+                | ($workflow.targets // [])[]
                 | {
                     repo: $repo_entry.repo,
                     ref: ($repo_entry.default_branch // $fallback_branch),
                     workflow_file: $workflow.file,
                     workflow_label: ($workflow.label // ($workflow.file | gsub("\\.ya?ml$"; ""))),
-                    environment: .,
-                    working_directory: ($workflow.working_directory // "."),
-                    terraform_version: ($workflow.terraform_version // $fallback_tf),
-                    blob_container: $container
+                    environment: (.dispatch_inputs.environment // "unknown"),
+                    dispatch_inputs: .dispatch_inputs
                   }
               ]
-            # Dedupe on the label, not the file name: two workflows in the same
-            # repository can legitimately share a caller file name while
-            # targeting different Terraform directories.
-            | unique_by(.repo + "|" + .workflow_label + "|" + .workflow_file + "|" + .environment)
+            # Dedupe on the full input set: two targets that dispatch the same
+            # workflow with identical inputs would otherwise create ambiguous runs.
+            | unique_by([.repo, .workflow_file, .workflow_label, (.dispatch_inputs | tojson)] | join("|"))
             | map(select($filter == "" or (.repo | test($filter))))
           ' "$CONFIG_FILE")
 
           count=$(jq 'length' <<< "$matrix")
 
-          max_parallel=$(jq -r '.defaults.max_parallel // 5' "$CONFIG_FILE")
+          max_parallel=$(jq -r '.defaults.max_parallel // 1' "$CONFIG_FILE")
           if ! [[ "$max_parallel" =~ ^[0-9]+$ ]]; then
-            echo "::warning::defaults.max_parallel is not an integer - falling back to 5"
-            max_parallel=5
+            echo "::warning::defaults.max_parallel is not an integer - falling back to 1"
+            max_parallel=1
           fi
           # Keep the fan-out polite: 1..10 concurrent dispatches.
           if (( max_parallel < 1 )); then max_parallel=1; fi
@@ -186,13 +186,7 @@ jobs:
           TARGET_REF: ${{ matrix.ref }}
           WORKFLOW_FILE: ${{ matrix.workflow_file }}
           WORKFLOW_LABEL: ${{ matrix.workflow_label }}
-          ENVIRONMENT: ${{ matrix.environment }}
-          WORKING_DIRECTORY: ${{ matrix.working_directory }}
-          TERRAFORM_VERSION: ${{ matrix.terraform_version }}
-          BLOB_CONTAINER: ${{ matrix.blob_container }}
-          # Unique per dispatch: the caller stamps it into its run-name, which
-          # is how `verify` finds exactly this run again.
-          CORRELATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          DISPATCH_INPUTS: ${{ toJSON(matrix.dispatch_inputs) }}
           ORCHESTRATOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: bash scripts/dispatch-drift-check.sh
@@ -277,8 +271,8 @@ jobs:
             echo "| Verification job result | ${VERIFY_RESULT:-skipped} |"
             echo "| Orchestrator run | ${ORCHESTRATOR_RUN_URL} |"
             echo
-            echo "Drift reports land in Azure Blob Storage under \`<container>/drift-reports/YYYY-MM-DD/\`;"
-            echo "the container comes from \`defaults.blob_container\` in \`repos.json\`."
+            echo "Drift reports are written by each target run to \`<container>/drift-reports/YYYY-MM-DD/\`"
+            echo "in the storage account that target pipeline already uses."
             echo "A green sweep means every dispatched target run finished green -"
             echo "see the \`Verify dispatched runs\` job for the per-target table."
           } >> "$GITHUB_STEP_SUMMARY"

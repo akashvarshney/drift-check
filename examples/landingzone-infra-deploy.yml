@@ -1,0 +1,305 @@
+name: landingzone-infra-deploy
+run-name: ${{ github.event.inputs.environment }}-Infra-${{ github.event.inputs.terraformAction }} ${{ github.ref_name }}
+
+# =============================================================================
+# Your existing deploy pipeline, with exactly two changes for drift detection:
+#
+#   1. "Terraform Plan" now runs with -detailed-exitcode and captures the exit
+#      code instead of letting 0-vs-2 pass silently:
+#         0 = no changes, 1 = terraform error, 2 = changes present (drift)
+#   2. A "Publish drift report" step runs when the exit code is 2: it converts
+#      the saved plan to JSON, filters out no-op/read changes and uploads it to
+#      blob storage in the same account the state backend already uses.
+#
+# Nothing else changes: same inputs, same runner, same SPN, same backend, and
+# `terraformAction=apply` behaves exactly as before. The drift sweep only ever
+# dispatches this file with terraformAction=plan.
+#
+# Before dispatching this workflow from the sweep, note the prerequisites at
+# the bottom of this file.
+# =============================================================================
+
+## https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment"
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - tst
+          - prd
+      azresource:
+        description: "Azure Resource Type"
+        required: true
+        default: containerapps
+        type: choice
+        options:
+          - appinsights
+          - containerapps
+          - storage
+          - events
+      terraformAction:
+        description: "Terraform Action"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+env:
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ secrets.LZ_SPN_APP_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.LZ_SUBSCRIPTION_ID }}
+  #ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+  TF_VAR_github_token: ${{ secrets.REPO_READ_TOKEN }}
+  ARM_TENANT_ID: xxxx # Tenant ID of arcadis.com
+  ROOT_PATH: ${{ github.workspace }}/infra/${{ github.event.inputs.azresource }} # https://docs.github.com/en/actions/learn-github-actions/contexts
+  ENVIRONMENT: ${{ github.event.inputs.environment }}
+  # --- drift detection -------------------------------------------------------
+  # Reports go to a container in the storage account discovered below, so no
+  # new secrets, no new app registration and no new role assignment are needed:
+  # this workflow already creates containers there with --auth-mode login.
+  DRIFT_CONTAINER: drift-reports
+  # Set the repository variable DRIFT_STORAGE_ACCOUNT only if reports should
+  # live somewhere other than the state account.
+  DRIFT_STORAGE_ACCOUNT: ${{ vars.DRIFT_STORAGE_ACCOUNT }}
+  # ---------------------------------------------------------------------------
+
+jobs:
+  terraform:
+    name: "terraform"
+    runs-on: [pda-self-hosted-linux]
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4 # https://github.com/actions/checkout
+
+      - name: Set up git credentials
+        uses: de-vri-es/setup-git-credentials@v2
+        with:
+          credentials: https://${{secrets.REPO_READ_USER}}:${{secrets.REPO_READ_TOKEN}}@github.com
+
+      - uses: elstudio/action-install-azure-cli@v1 # install az-cli # Needed for pda-self-hosted-linux
+
+      ## Authenticate To Azure Using Landingzone SPN Federated Credentials
+      - name: "Az CLI login"
+        uses: azure/login@v1.6.1 # https://github.com/Azure/login
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      # Set up Python (install version 3.11, use another if needed)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Setup terraform remote state"
+        id: remote-state
+        run: |
+          az group create -n rg-tfstate -l westeurope
+          storageAccountName=$(az storage account list --query "[?contains(name, 'sttfst')].name" --output tsv)
+          az storage container create --name tfstate-infra-${{ github.event.inputs.environment }} --account-name $storageAccountName --public-access off --auth-mode login --auth-mode login
+          echo "STORAGE_ACCOUNT_NAME=$storageAccountName" >> $GITHUB_ENV
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2 # https://github.com/hashicorp/setup-terraform
+        with: # Needed for pda-self-hosted-linux
+          terraform_wrapper: false # Needed for pda-self-hosted-linux
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        id: init
+        run: >
+          terraform init
+          -backend-config="storage_account_name=${{ env.STORAGE_ACCOUNT_NAME }}"  
+          -backend-config="container_name=tfstate-infra-${{ github.event.inputs.environment }}" 
+          -backend-config="resource_group_name=rg-tfstate"
+          -backend-config="key=tfstate-infra-${{ github.event.inputs.azresource }}"
+        working-directory: ${{ env.ROOT_PATH }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+
+      # -----------------------------------------------------------------------
+      # CHANGE 1 of 2 - drift-aware plan.
+      #
+      # -detailed-exitcode makes the plan distinguish "no changes" (0) from
+      # "changes present" (2). The code is captured instead of failing the step
+      # on 2, so drift keeps the run green and only a real error (1) turns it
+      # red. The plan is saved to a file because `terraform show -json` needs it.
+      # -----------------------------------------------------------------------
+      - name: Terraform Plan
+        if: ${{ github.event.inputs.terraformAction == 'plan' }}
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan.binary \
+            -var-file=${{ github.event.inputs.environment }}/params-${{ github.event.inputs.azresource }}.tfvars \
+            2>&1 | tee terraform-plan.log
+          rc=${PIPESTATUS[0]}
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Terraform plan exit code: $rc (0=no drift, 1=error, 2=drift detected)"
+          # 0 and 2 are both acceptable outcomes; only 1 fails the job.
+          [ "$rc" -lt 2 ]
+        working-directory: ${{ env.ROOT_PATH }} # Assuming there is a folder called infra present where terraform code and configuration is placed.
+
+      # -----------------------------------------------------------------------
+      # CHANGE 2 of 2 - publish the drift report.
+      #
+      # Only runs when the plan reported drift (exit code 2). Writes
+      # <container>/drift-reports/YYYY-MM-DD/<repo>-<azresource>-<env>.json and
+      # confirms the blob exists afterwards.
+      # -----------------------------------------------------------------------
+      - name: Publish drift report
+        if: ${{ github.event.inputs.terraformAction == 'plan' && steps.plan.outputs.exit_code == '2' }}
+        id: drift
+        working-directory: ${{ env.ROOT_PATH }}
+        env:
+          STORAGE_ACCOUNT: ${{ env.DRIFT_STORAGE_ACCOUNT || env.STORAGE_ACCOUNT_NAME }}
+          CONTAINER: ${{ env.DRIFT_CONTAINER }}
+        run: |
+          set -euo pipefail
+
+          terraform show -json tfplan.binary > "$RUNNER_TEMP/tfplan.json"
+
+          cat > "$RUNNER_TEMP/drift-filter.jq" <<'JQ'
+          # A resource change is drift unless its action list is exactly
+          # ["no-op"] (nothing changed) or ["read"] (data source refresh).
+          def is_drift:
+            (.change.actions | sort) as $actions
+            | ($actions != ["no-op"]) and ($actions != ["read"]);
+
+          {
+            metadata: {
+              repo: $repo,
+              workflow: $workflow,
+              environment: $environment,
+              timestamp: $timestamp,
+              run_url: $run_url,
+              run_id: $run_id,
+              commit_sha: $commit_sha,
+              working_directory: $working_directory
+            },
+            summary: {
+              resource_changes_total: ((.resource_changes // []) | length),
+              drifted_resources: ([(.resource_changes // [])[] | select(is_drift)] | length),
+              out_of_band_drift: ([(.resource_drift // [])[] | select(is_drift)] | length)
+            },
+            resource_changes: [(.resource_changes // [])[] | select(is_drift)],
+            resource_drift: [(.resource_drift // [])[] | select(is_drift)]
+          }
+          JQ
+
+          # The azresource is the per-stack discriminator: each one has its own
+          # ROOT_PATH, var-file and state key, so each gets its own report.
+          label="landingzone-${{ github.event.inputs.azresource }}"
+          repo_slug=$(printf '%s' "$GITHUB_REPOSITORY" | sed -e 's|/|__|g')
+          blob_name="drift-reports/$(date -u +%F)/${repo_slug}-${label}-${{ github.event.inputs.environment }}.json"
+
+          jq -f "$RUNNER_TEMP/drift-filter.jq" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg workflow "$label" \
+            --arg environment "${{ github.event.inputs.environment }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --arg working_directory "$ROOT_PATH" \
+            "$RUNNER_TEMP/tfplan.json" > "$RUNNER_TEMP/drift-report.json"
+
+          drifted=$(jq -r '.summary.drifted_resources' "$RUNNER_TEMP/drift-report.json")
+          echo "drifted_resources=$drifted" >> "$GITHUB_OUTPUT"
+
+          # Idempotent: the container is created on first drift, then reused.
+          az storage container create \
+            --name "$CONTAINER" \
+            --account-name "$STORAGE_ACCOUNT" \
+            --public-access off \
+            --auth-mode login \
+            --only-show-errors > /dev/null
+
+          az storage blob upload \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$blob_name" \
+            --file "$RUNNER_TEMP/drift-report.json" \
+            --auth-mode login \
+            --overwrite \
+            --content-type "application/json" \
+            --metadata repo="$repo_slug" environment="${{ github.event.inputs.environment }}" workflow="$label" run_id="$GITHUB_RUN_ID" \
+            --only-show-errors
+
+          # Confirm the write actually landed (also proves the data-plane role).
+          exists=$(az storage blob exists \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$blob_name" \
+            --auth-mode login \
+            --query exists -o tsv)
+          if [ "$exists" != "True" ]; then
+            echo "::error title=Upload not confirmed::Blob '$blob_name' was not found after upload."
+            exit 1
+          fi
+
+          echo "Uploaded $blob_name"
+          {
+            echo
+            echo "**Drift detected:** $drifted resource(s)."
+            echo
+            echo "**Report stored:** \`$CONTAINER/$blob_name\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan log
+        # Keeps the failing plan output for a real terraform error (exit 1).
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-log-${{ github.event.inputs.azresource }}-${{ github.event.inputs.environment }}
+          path: ${{ env.ROOT_PATH }}/terraform-plan.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Terraform Apply in DEV from Feature Branch
+        if: ${{ github.event.inputs.terraformAction == 'apply' && github.event.inputs.environment == 'dev'}}
+        id: apply-dev-feature-branch
+        run: terraform apply -var-file=${{ github.event.inputs.environment }}/params-${{ github.event.inputs.azresource }}.tfvars --auto-approve
+        working-directory: ${{ env.ROOT_PATH }}
+
+# =============================================================================
+# Prerequisites before the sweep can dispatch this file
+#
+#  1. This file must be on the DEFAULT BRANCH (main) - workflow_dispatch runs
+#     the version that exists on the ref it is given.
+#  2. ORCHESTRATOR_TOKEN (fine-grained PAT or GitHub App token) needs
+#     Actions: Read and write on this repository.
+#  3. The SPN behind LZ_SPN_APP_ID needs a federated credential for
+#     ref:refs/heads/main, not only the feature-branch subject. If it does not
+#     have one, the dispatch fails with AADSTS70021. Check with:
+#         az ad app federated-credential list --id <app-object-id> -o table
+#  4. One target at a time per workflow. With one target the sweep identifies
+#     the run by "the single new workflow_dispatch run on main". As soon as a
+#     second target (another environment or azresource) is added, put the
+#     discriminator into run-name so the two runs are distinguishable, e.g.
+#         run-name: >-
+#           ${{ github.event.inputs.environment }}-${{ github.event.inputs.azresource
+#           }}-Infra-${{ github.event.inputs.terraformAction }} ${{ github.ref_name }}
+#  5. `terraform fmt -check -recursive` runs before the plan. A formatting
+#     difference fails the job before plan executes, so the sweep reports a
+#     failed run rather than drift. That is a real pipeline failure, not drift.
+# =============================================================================

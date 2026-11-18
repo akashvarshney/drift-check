@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Dispatch a single Phase 1 drift check in a target repository, then find the
-# run the dispatch created.
+# Dispatch ONE drift check by triggering a target repository's EXISTING
+# Terraform workflow.
 #
-# `workflow_dispatch` returns 204 with no body, so the run id is discovered
-# from the Actions runs API:
-#   * primary  - match the unique correlation id the orchestrator injects into
-#                the caller's `run-name` (see examples/target-repo-caller.yml)
-#   * fallback - for callers that do not declare `correlation_id`, take the
-#                single run that appeared after a pre-dispatch baseline
+# Nothing is installed into the target repository: the orchestrator calls the
+# same `workflow_dispatch` entry point a human would use, passing only the
+# inputs that workflow already declares (see targets[].dispatch_inputs in
+# repos.json). The only target-side change is that the plan step captures
+# `-detailed-exitcode` and uploads a report when the exit code is 2.
+#
+# `workflow_dispatch` returns 204 with no body, so the created run is found
+# afterwards from the Actions runs API:
+#   * primary  - a run whose display title contains CORRELATION_ID (only used
+#                when the target workflow's `run-name` carries it)
+#   * fallback - the single run that appeared after a pre-dispatch baseline
 #
 # The discovered run is written to $RUNNER_TEMP/run-info/<name>.json and
 # uploaded as a build artifact; the `verify` job polls it to completion so a
@@ -18,14 +23,16 @@
 #   GH_TOKEN            fine-grained PAT / GitHub App token (Actions: write)
 #   TARGET_REPO         owner/name
 #   TARGET_REF          branch to run on (always the default branch)
-#   WORKFLOW_FILE       workflow file name, e.g. terraform-drift-check.yml
-#   ENVIRONMENT         dev | staging | prod | ...
+#   WORKFLOW_FILE       the target's existing workflow file, e.g.
+#                       landingzone-infra-deploy.yml
+#   DISPATCH_INPUTS     JSON object of workflow_dispatch inputs, e.g.
+#                       {"environment":"dev","azresource":"containerapps",
+#                        "terraformAction":"plan"}
 # Optional environment:
-#   BLOB_CONTAINER         report container (from repos.json defaults)
-#   CORRELATION_ID         unique per dispatch; delivered to the caller run name
-#   WORKFLOW_LABEL         short label used in blob names
-#   WORKING_DIRECTORY      terraform directory, may contain {environment}
-#   TERRAFORM_VERSION      terraform version to install
+#   CORRELATION_ID         unique per dispatch; passed through as an input and
+#                          used to find the run (only if the workflow declares
+#                          it and stamps it into `run-name`)
+#   WORKFLOW_LABEL         short label used in report names and summaries
 #   ORCHESTRATOR_RUN_URL   link back to the sweep
 #   DRY_RUN                "true" to log the payload without calling the API
 #   GITHUB_API_URL         API base (defaults to https://api.github.com)
@@ -39,17 +46,14 @@ set -euo pipefail
 : "${TARGET_REPO:?TARGET_REPO is required}"
 : "${TARGET_REF:?TARGET_REF is required}"
 : "${WORKFLOW_FILE:?WORKFLOW_FILE is required}"
-: "${ENVIRONMENT:?ENVIRONMENT is required}"
 
 GITHUB_API_URL="${GITHUB_API_URL:-https://api.github.com}"
 GITHUB_API_URL="${GITHUB_API_URL%/}"
 DRY_RUN="${DRY_RUN:-false}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
-BLOB_CONTAINER="${BLOB_CONTAINER:-drift-reports}"
+DISPATCH_INPUTS="${DISPATCH_INPUTS:-}"
 CORRELATION_ID="${CORRELATION_ID:-}"
 WORKFLOW_LABEL="${WORKFLOW_LABEL:-}"
-WORKING_DIRECTORY="${WORKING_DIRECTORY:-.}"
-TERRAFORM_VERSION="${TERRAFORM_VERSION:-1.9.8}"
 ORCHESTRATOR_RUN_URL="${ORCHESTRATOR_RUN_URL:-}"
 RUN_DISCOVERY_TIMEOUT="${RUN_DISCOVERY_TIMEOUT:-180}"
 RUN_INFO_DIR="${RUN_INFO_DIR:-${RUNNER_TEMP:-/tmp}/run-info}"
@@ -59,12 +63,24 @@ log() { printf '[dispatch] %s\n' "$*"; }
 endpoint="$GITHUB_API_URL/repos/$TARGET_REPO/actions/workflows/$WORKFLOW_FILE/dispatches"
 runs_endpoint="$GITHUB_API_URL/repos/$TARGET_REPO/actions/workflows/$WORKFLOW_FILE/runs"
 
-# Azure container names: 3-63 chars, lowercase letters, digits and hyphens,
-# starting and ending alphanumeric.
-if ! [[ "$BLOB_CONTAINER" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
-  echo "::error title=Invalid blob container::'$BLOB_CONTAINER' is not a valid Azure container name. Fix defaults.blob_container (or the workflow override) in repos.json."
+# -----------------------------------------------------------------------------
+# Inputs. Every key below must be declared by the target workflow, because
+# workflow_dispatch answers 422 for any input it does not know. There is no
+# fallback payload: an undeclared input is a configuration mistake in
+# repos.json and is reported as one.
+# -----------------------------------------------------------------------------
+if [ -z "$DISPATCH_INPUTS" ]; then
+  echo "::error title=Missing dispatch inputs::DISPATCH_INPUTS is empty. Add targets[].dispatch_inputs to repos.json."
   exit 1
 fi
+
+if ! jq -e 'type == "object" and length > 0' >/dev/null 2>&1 <<< "$DISPATCH_INPUTS"; then
+  echo "::error title=Invalid dispatch inputs::DISPATCH_INPUTS must be a non-empty JSON object of workflow_dispatch inputs."
+  exit 1
+fi
+
+# The environment drives job titles, report names and the run-info record.
+ENVIRONMENT=$(jq -r '.environment // "unknown"' <<< "$DISPATCH_INPUTS" | tr -d '\n')
 
 # Blob-safe / artifact-safe identifiers for the run info file name.
 repo_slug=$(printf '%s' "$TARGET_REPO" | sed -e 's|/|__|g' -e 's|[^A-Za-z0-9._-]|_|g')
@@ -74,47 +90,15 @@ label_slug=$(printf '%s' "$label" | sed -e 's|[^A-Za-z0-9._-]|_|g')
 env_slug=$(printf '%s' "$ENVIRONMENT" | sed -e 's|[^A-Za-z0-9._-]|_|g')
 run_info_file="$RUN_INFO_DIR/drift-run-${repo_slug}-${label_slug}-${env_slug}.json"
 
-# -----------------------------------------------------------------------------
-# Payloads. Every input below must be declared by the target caller workflow;
-# workflow_dispatch returns 422 for unknown inputs.
-# -----------------------------------------------------------------------------
 build_payload() {
   jq -n \
     --arg ref "$TARGET_REF" \
-    --arg environment "$ENVIRONMENT" \
-    --arg working_directory "$WORKING_DIRECTORY" \
-    --arg terraform_version "$TERRAFORM_VERSION" \
-    --arg workflow_label "$WORKFLOW_LABEL" \
-    --arg orchestrator_run_url "$ORCHESTRATOR_RUN_URL" \
-    --arg blob_container "$BLOB_CONTAINER" \
+    --argjson inputs "$DISPATCH_INPUTS" \
     --arg correlation_id "$CORRELATION_ID" \
     '{
        ref: $ref,
-       inputs: ({
-         environment: $environment,
-         drift_check_only: "true",
-         working_directory: $working_directory,
-         terraform_version: $terraform_version,
-         workflow_label: $workflow_label,
-         orchestrator_run_url: $orchestrator_run_url,
-         blob_container: $blob_container
-       }
-       + (if $correlation_id == "" then {} else {correlation_id: $correlation_id} end))
-     }'
-}
-
-# Minimal payload for callers that do not declare the optional inputs
-# (sending an undeclared input makes workflow_dispatch return 422).
-build_minimal_payload() {
-  jq -n \
-    --arg ref "$TARGET_REF" \
-    --arg environment "$ENVIRONMENT" \
-    '{
-       ref: $ref,
-       inputs: {
-         environment: $environment,
-         drift_check_only: "true"
-       }
+       inputs: ($inputs
+                + (if $correlation_id == "" then {} else {correlation_id: $correlation_id} end))
      }'
 }
 
@@ -123,17 +107,17 @@ build_minimal_payload() {
 # Gives a far clearer message than the 404/422 returned by dispatch.
 # -----------------------------------------------------------------------------
 preflight() {
-  local err
+  local err rc
   set +e
   err=$(gh api "$GITHUB_API_URL/repos/$TARGET_REPO/actions/workflows/$WORKFLOW_FILE" 2>&1 >/dev/null)
-  local rc=$?
+  rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then
     return 0
   fi
   case "$err" in
     *"HTTP 404"*)
-      echo "::error title=Workflow not found::\`$WORKFLOW_FILE\` does not exist in \`$TARGET_REPO\`. Add examples/target-repo-caller.yml to that repository."
+      echo "::error title=Workflow not found::\`$WORKFLOW_FILE\` does not exist on ref \`$TARGET_REF\` in \`$TARGET_REPO\`. Check workflows[].file and default_branch in repos.json."
       ;;
     *"HTTP 403"*)
       echo "::error title=Missing permission::ORCHESTRATOR_TOKEN cannot read Actions in \`$TARGET_REPO\`. Grant the token Actions: read/write on that repository."
@@ -142,7 +126,7 @@ preflight() {
       echo "::error title=Preflight failed::Unable to inspect \`$TARGET_REPO\`. $err"
       ;;
   esac
-  exit 1
+  return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -160,7 +144,8 @@ list_recent_runs() {
     || printf '[]'
 }
 
-# Echo the run object (JSON) for the dispatch, or return 1 after the timeout.
+# Echo the run object (JSON) for the dispatch, or return 1 after the timeout
+# (2 when several new runs appeared and none could be identified).
 discover_run() {
   local deadline=$(( SECONDS + RUN_DISCOVERY_TIMEOUT ))
   local runs match count
@@ -168,7 +153,7 @@ discover_run() {
   while :; do
     runs=$(list_recent_runs)
 
-    if [ "$correlation_delivered" = "true" ] && [ -n "$CORRELATION_ID" ]; then
+    if [ -n "$CORRELATION_ID" ]; then
       match=$(jq -c --arg correlation "$CORRELATION_ID" \
         '[.[] | select((.display_title // "") | contains($correlation))]
          | sort_by(.id) | last // empty' <<< "$runs")
@@ -178,7 +163,7 @@ discover_run() {
          | sort_by(.id)' <<< "$runs")
       count=$(jq 'length' <<< "$match")
       if [ "$count" -gt 1 ]; then
-        echo "::error title=Ambiguous dispatch::$count new \`$WORKFLOW_FILE\` runs appeared on \`$TARGET_REPO@$TARGET_REF\`, so the dispatched run cannot be identified. Update the caller workflow to declare the \`correlation_id\` input and set \`run-name\` (see examples/target-repo-caller.yml)." >&2
+        echo "::error title=Ambiguous dispatch::$count new \`$WORKFLOW_FILE\` runs appeared on \`$TARGET_REPO@$TARGET_REF\`, so the dispatched run cannot be identified. Sweep one target at a time per workflow, or add the environment/azresource to that workflow's \`run-name\` so runs are distinguishable." >&2
         return 2
       fi
       match=$(jq -c '.[0] // empty' <<< "$match")
@@ -209,6 +194,7 @@ write_run_info() {
     --arg environment "$ENVIRONMENT" \
     --arg run_id "$run_id" \
     --arg run_url "$run_url" \
+    --argjson dispatch_inputs "$DISPATCH_INPUTS" \
     --arg correlation_id "$CORRELATION_ID" \
     --arg orchestrator_run_url "$ORCHESTRATOR_RUN_URL" \
     --arg dispatched_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -219,6 +205,7 @@ write_run_info() {
        workflow_file: $workflow_file,
        workflow_label: $workflow_label,
        environment: $environment,
+       dispatch_inputs: $dispatch_inputs,
        run_id: ($run_id | tonumber? // 0),
        run_url: $run_url,
        correlation_id: $correlation_id,
@@ -232,7 +219,7 @@ write_run_info() {
 # -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
-log "target=$TARGET_REPO ref=$TARGET_REF workflow=$WORKFLOW_FILE environment=$ENVIRONMENT container=$BLOB_CONTAINER"
+log "target=$TARGET_REPO ref=$TARGET_REF workflow=$WORKFLOW_FILE inputs=$DISPATCH_INPUTS"
 
 payload=$(build_payload)
 
@@ -244,17 +231,13 @@ if [ "$DRY_RUN" = "true" ]; then
   exit 0
 fi
 
-preflight
+preflight || exit 1
 
 # Fallback correlation needs a "before" snapshot: any run newer than this is a
 # candidate for the dispatch below.
 baseline_run_id=$(list_recent_runs | jq 'map(.id) | max // 0')
 not_before=$(date -u -d '-2 minutes' +%Y-%m-%dT%H:%M:%SZ)
 log "baseline run id for $WORKFLOW_FILE@$TARGET_REF: $baseline_run_id"
-
-# False when the 422 fallback path was used: the caller then never received the
-# correlation id, so discovery must fall back to the baseline heuristic.
-correlation_delivered=true
 
 attempt=1
 while :; do
@@ -272,22 +255,12 @@ while :; do
 
   case "$err" in
     *"HTTP 404"*)
-      echo "::error title=Dispatch 404::\`$WORKFLOW_FILE\` on ref \`$TARGET_REF\` was not found in \`$TARGET_REPO\`. Check the branch name in repos.json and that the workflow exists on that branch."
+      echo "::error title=Dispatch 404::\`$WORKFLOW_FILE\` on ref \`$TARGET_REF\` was not found in \`$TARGET_REPO\`. Check default_branch in repos.json and that the workflow exists on that branch."
       write_run_info "" "" "dispatch failed: workflow not found on ref $TARGET_REF (HTTP 404)"
       exit 1
       ;;
     *"HTTP 422"*)
-      log "422 - retrying once with the minimal input set"
-      set +e
-      err2=$(printf '%s' "$(build_minimal_payload)" | gh api --method POST "$endpoint" --input - 2>&1 >/dev/null)
-      rc2=$?
-      set -e
-      if [ "$rc2" -eq 0 ]; then
-        log "dispatched with minimal inputs - update the caller workflow to declare all inputs"
-        correlation_delivered=false
-        break
-      fi
-      echo "::error title=Dispatch 422::Ref or inputs rejected for \`$TARGET_REPO\`. Ensure the workflow declares the workflow_dispatch inputs and is enabled. $err2"
+      echo "::error title=Dispatch 422::Ref or inputs rejected for \`$TARGET_REPO\`. Every key in targets[].dispatch_inputs must be a \`workflow_dispatch\` input declared by \`$WORKFLOW_FILE\`, and the value must match its type (choice inputs only accept their listed options). Sent: $DISPATCH_INPUTS. API said: $err"
       write_run_info "" "" "dispatch failed: inputs rejected (HTTP 422)"
       exit 1
       ;;
@@ -332,7 +305,7 @@ else
   rc=$?
   reason="the dispatched run did not appear within ${RUN_DISCOVERY_TIMEOUT}s"
   if [ "$rc" -ne 2 ]; then
-    echo "::error title=Dispatched run not found::Could not identify the run created for \`$TARGET_REPO\` / \`$WORKFLOW_FILE\` / \`$ENVIRONMENT\`. Ensure the caller workflow declares the \`correlation_id\` input and sets \`run-name\` (see examples/target-repo-caller.yml)."
+    echo "::error title=Dispatched run not found::Could not identify the run created for \`$TARGET_REPO\` / \`$WORKFLOW_FILE\`. Check that the workflow is enabled and that its \`run-name\` is stable."
   fi
   write_run_info "" "" "$reason"
   exit 1
@@ -343,8 +316,7 @@ fi
   echo
   echo "- Repository: \`$TARGET_REPO\` @ \`$TARGET_REF\`"
   echo "- Workflow: \`$WORKFLOW_FILE\`"
-  echo "- Environment: \`$ENVIRONMENT\`"
-  echo "- Report container: \`$BLOB_CONTAINER\`"
+  echo "- Inputs: \`$DISPATCH_INPUTS\`"
   echo "- Run: [$run_id]($run_url)"
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 

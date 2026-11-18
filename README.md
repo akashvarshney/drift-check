@@ -1,18 +1,17 @@
 # Terraform Drift Detection — Phase 1
 
-Serverless, GitHub Actions only. No containers to run, no Azure Automation
-Account, no self-hosted infrastructure.
+Serverless, GitHub Actions only. One central repository triggers the Terraform
+pipelines that already exist in your other repos, collects a JSON report when
+they detect drift, and fails its own run when a triggered pipeline fails.
 
-A daily cron (or a manual run) sweeps every `(repository x workflow x environment)`
-combination listed in `repos.json`, triggers each target repository's Terraform
-pipeline with `workflow_dispatch`, runs `terraform plan -detailed-exitcode`, and
-— when drift is detected — uploads a `jq`-filtered JSON report to Azure Blob
-Storage over passwordless OIDC.
+**Nothing is installed into the target repositories except two changes to the
+plan step of a pipeline you already have.** No caller workflow, no reusable
+workflow, no new app registration, no new secrets.
 
-**Phase 1 ends when the report is in the container.** AI analysis and Teams
-notifications are Phase 2.
+Start with a single target (`dev` + `containerapps`), confirm it, then add the
+rest as `repos.json` entries only.
 
-See [docs/architecture.md](docs/architecture.md) for the Mermaid diagrams.
+See [docs/architecture.md](docs/architecture.md) for the flow diagram.
 
 ---
 
@@ -20,82 +19,98 @@ See [docs/architecture.md](docs/architecture.md) for the Mermaid diagrams.
 
 | Path | Purpose |
 | --- | --- |
-| `repos.json` | Central inventory: repositories, workflows, environments, defaults |
-| `.github/workflows/drift-orchestrator.yml` | Cron + manual sweep; builds the matrix and dispatches |
-| `.github/workflows/reusable-drift-check.yml` | All drift logic: plan, filter, upload (called by targets) |
-| `scripts/dispatch-drift-check.sh` | REST `workflow_dispatch` helper: preflight, retry, run correlation, clear errors |
-| `scripts/await-drift-runs.sh` | Polls every dispatched run and fails the sweep when one did not finish green |
-| `examples/target-repo-caller.yml` | Copy into each Terraform repo as `.github/workflows/terraform-drift-check.yml` |
-| `examples/standalone-drift-job.yml` | Self-contained fallback when cross-repo reuse is not possible |
-| `azure/setup.sh` | Azure CLI bootstrap (storage, container, app registration, federation, RBAC) |
-| `azure/terraform/` | Same resources as code |
-| `docs/architecture.md` | Mermaid flow + OIDC sequence diagrams |
+| `repos.json` | Which repository, which existing workflow, which inputs. The only file you edit to add targets |
+| `.github/workflows/drift-orchestrator.yml` | Cron + manual sweep: validate, fan out, dispatch, verify |
+| `scripts/dispatch-drift-check.sh` | `workflow_dispatch` helper: preflight, retry, run discovery, clear errors |
+| `scripts/await-drift-runs.sh` | Polls every dispatched run; fails the sweep if one did not finish green |
+| `examples/landingzone-infra-deploy.yml` | Your deploy pipeline with the two drift changes applied — copy over the original |
+| `docs/architecture.md` | Flow + sequence diagrams |
+| `azure/` | **Not needed** for this design. Kept only if you later want a dedicated drift storage account instead of reusing the state account |
 
 ---
 
-## How it works
+## What the sweep does
 
-1. **Trigger** — `schedule` (02:00 UTC daily) or `workflow_dispatch` with an
-   optional `repository_filter` regex and `dry_run` toggle.
-2. **Prepare** — `repos.json` is validated and flattened with `jq` into one
-   matrix row per environment: `{repo, ref, workflow_file, workflow_label,
-   environment, working_directory, terraform_version, blob_container}`. The
-   container comes from `defaults.blob_container`, with an optional
-   `workflows[].blob_container` override.
-3. **Dispatch** — one job per row, `max-parallel` from `defaults.max_parallel`
-   (clamped to 1–10), `fail-fast: false`. Each job preflights the workflow file,
-   then `POST`s to the dispatches endpoint on the **default branch**, sending
-   the report container and a unique correlation id.
-4. **Correlate** — `workflow_dispatch` returns no run id, so the dispatch job
-   finds the run it created: the caller stamps the correlation id into its
-   `run-name`, and the job waits for the matching run, then records its id and
-   URL as a build artifact.
-5. **Verify** — one job polls every recorded run to completion. A target run
-   that ends with any conclusion other than `success`, a dispatch whose run was
-   never identified, or a missing record fails the sweep, so green means every
-   plan really ran green. Wall-clock budget: `MAX_WAIT_SECONDS` (default 3600,
-   override with the repository variable `DRIFT_VERIFY_TIMEOUT_SECONDS`).
-6. **Drift check** — the target caller invokes the reusable workflow, which logs
-   in to Azure with OIDC, runs `terraform init` and
-   `terraform plan -detailed-exitcode -out=tfplan.binary`.
-7. **Branch** — exit code decides what happens:
+1. **Prepare** — `repos.json` is validated and flattened with `jq` into one
+   matrix row per target: `{repo, ref, workflow_file, workflow_label,
+   environment, dispatch_inputs}`.
+2. **Dispatch** — one job per row POSTs to
+   `/repos/{owner}/{repo}/actions/workflows/{file}/dispatches` on the target's
+   **default branch**, with `inputs` exactly as written in `repos.json`.
+   `max-parallel` comes from `defaults.max_parallel` (1–10).
+3. **Target runs** — your existing pipeline does what it always does:
+   checkout, `azure/login` with the landing-zone SPN, `terraform init` against
+   `rg-tfstate`, then `terraform plan -detailed-exitcode`.
+4. **Report** — exit code decides:
 
-| Exit code | Meaning | Orchestrator/target result | Upload |
+| Exit code | Meaning | Target run | Report |
 | --- | --- | --- | --- |
 | `0` | No drift | green | none |
-| `1` | Terraform error | **red** (alerting) | plan log artifact (7 days) |
-| `2` | Drift detected | green | `drift-report.json` → Blob Storage |
+| `1` | Terraform error | **red** | plan log artifact (7 days) |
+| `2` | Drift detected | green | `drift-report.json` → blob storage |
 
-8. **Report** — `terraform show -json tfplan.binary` → `jq` drops `no-op` and
-   `read` actions, keeps every real change, wraps it with metadata.
+5. **Verify** — the sweep polls each dispatched run. Any conclusion other than
+   `success`, any run it could not identify, or any missing record fails the
+   sweep. Green sweep = every plan really ran green. Time budget is
+   `MAX_WAIT_SECONDS` (default 3600, override with the repository variable
+   `DRIFT_VERIFY_TIMEOUT_SECONDS`).
+6. **Summarise** — a final job writes the sweep table.
 
-Blob path:
+---
+
+## The two changes in your repository
+
+`examples/landingzone-infra-deploy.yml` is your file with only these applied:
+
+**1. The plan step captures `-detailed-exitcode`.**
+
+```yaml
+- name: Terraform Plan
+  if: ${{ github.event.inputs.terraformAction == 'plan' }}
+  id: plan
+  run: |
+    set +e
+    terraform plan -detailed-exitcode -out=tfplan.binary \
+      -var-file=${{ github.event.inputs.environment }}/params-${{ github.event.inputs.azresource }}.tfvars \
+      2>&1 | tee terraform-plan.log
+    rc=${PIPESTATUS[0]}
+    echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+    [ "$rc" -lt 2 ]     # 0 and 2 are both fine; only 1 fails the job
+  working-directory: ${{ env.ROOT_PATH }}
+```
+
+Without `-detailed-exitcode` a plan with changes exits `0`, which is why a
+drift sweep of an untouched pipeline always reports "no drift".
+
+**2. A "Publish drift report" step runs when the exit code is `2`.** It runs
+`terraform show -json tfplan.binary`, drops `no-op` and `read` changes with
+`jq`, wraps the rest in metadata, and uploads to:
 
 ```
-<container>/drift-reports/YYYY-MM-DD/<owner>__<repo>-<workflow_label>-<environment>.json
-# e.g. drift-reports/drift-reports/2026-11-18/acme-corp__infra-network-network-prod.json
+<DRIFT_CONTAINER>/drift-reports/YYYY-MM-DD/<owner>__<repo>-landingzone-<azresource>-<environment>.json
+# e.g. drift-reports/drift-reports/2026-11-18/acme-corp__landingzone-infra-landingzone-containerapps-dev.json
 ```
 
-`<container>` is `defaults.blob_container` from `repos.json` (or a
-`workflows[].blob_container` override), passed to the caller as an input. Keep
-it equal to the container `azure/setup.sh` created.
+`DRIFT_CONTAINER` defaults to `drift-reports` and lives in the same storage
+account the state backend already uses (the one found by the existing
+`sttfst` query), so **no new secrets, no new app registration and no role
+assignment are needed** — the pipeline already creates containers there with
+`--auth-mode login`. Point reports elsewhere only if you want to: set the
+repository variable `DRIFT_STORAGE_ACCOUNT`.
 
 Report shape:
 
 ```json
 {
   "metadata": {
-    "repo": "acme-corp/infra-network",
-    "workflow": "network",
-    "environment": "prod",
+    "repo": "acme-corp/landingzone-infra",
+    "workflow": "landingzone-containerapps",
+    "environment": "dev",
     "timestamp": "2026-11-18T02:04:11Z",
-    "run_url": "https://github.com/acme-corp/infra-network/actions/runs/123",
+    "run_url": "https://github.com/acme-corp/landingzone-infra/actions/runs/123",
     "run_id": "123",
-    "run_attempt": "1",
     "commit_sha": "abc123...",
-    "working_directory": "environments/prod",
-    "orchestrator_run_url": "https://github.com/acme-corp/drift-check/actions/runs/456",
-    "detected_by": "terraform-drift-detection/phase-1"
+    "working_directory": "/home/runner/_work/landingzone-infra/infra/containerapps"
   },
   "summary": {
     "resource_changes_total": 42,
@@ -109,81 +124,14 @@ Report shape:
 
 ---
 
-## Prerequisites
-
-- Azure subscription where you can create a storage account and an app registration.
-- `az` CLI logged in, `gh` CLI logged in, `jq` (for `azure/setup.sh`).
-- Terraform **≥ 1.6** locally only if you plan to run `terraform validate`.
-- Each target repository already has working Terraform pipelines (state backend,
-  provider credentials). This repo does not create them.
-
----
-
-## Step 1 — Azure (storage, federation, RBAC)
-
-### Option A: CLI (recommended for the first run)
-
-```bash
-az login
-gh auth login
-
-# Optional overrides:
-#   SUBSCRIPTION_ID, LOCATION, RESOURCE_GROUP, STORAGE_ACCOUNT, CONTAINER_NAME,
-#   APP_NAME, RETENTION_DAYS, SUBJECT_FORMAT=auto|mutable|immutable
-./azure/setup.sh
-```
-
-The script is idempotent and creates:
-
-- storage account — public blob access **off**, shared key access **off**, TLS 1.2
-- `drift-reports` container (private)
-- blob versioning + a lifecycle rule that deletes reports after `RETENTION_DAYS` (90)
-- Entra app registration + service principal
-- **one federated credential per enabled repo/branch** in `repos.json`
-  (auto-detects GitHub's immutable subject format)
-- `Storage Blob Data Contributor` **scoped to the container only**
-
-It prints the four values you need for GitHub secrets.
-
-### Option B: Terraform
-
-```bash
-cd azure/terraform
-cp terraform.tfvars.example terraform.tfvars   # set storage_account_name + repos
-terraform init
-terraform apply
-terraform output
-```
-
-Keep `github_repositories` in step with `repos.json`. For repositories on the
-immutable subject format, set `subject` explicitly per entry.
-
----
-
-## Step 2 — GitHub org secrets
-
-Organization → Settings → Secrets and variables → Actions → **New organization secret**:
-
-| Secret | Value |
-| --- | --- |
-| `AZURE_CLIENT_ID` | app registration client (application) ID |
-| `AZURE_TENANT_ID` | Entra tenant ID |
-| `AZURE_SUBSCRIPTION_ID` | subscription ID |
-| `AZURE_STORAGE_ACCOUNT` | storage account name |
-
-Set **Repository access → All repositories** so each target repo resolves them
-through `secrets: inherit`.
-
----
-
-## Step 3 — Orchestrator token
+## Step 1 — Orchestrator token
 
 `GITHUB_TOKEN` cannot dispatch workflows in *other* repositories. Create a
 fine-grained PAT:
 
 - **Repository access:** the target repositories (or all repos in the org)
-- **Permissions:** `Actions: Read and write` (read is used by the verify job to
-  poll run status), `Contents: Read`, `Metadata: Read`
+- **Permissions:** `Actions: Read and write` (read is used to poll run status),
+  `Contents: Read`, `Metadata: Read`
 - **Expiry:** 90 days or less, and calendar a rotation
 
 Store it in **this** repository as the secret `ORCHESTRATOR_TOKEN`.
@@ -200,30 +148,53 @@ GitHub App alternative:
 ```
 
 Then set `GH_TOKEN: ${{ steps.app-token.outputs.token }}` on the dispatch step.
+The script treats the token as opaque, so nothing else changes.
 
 ---
 
-## Step 4 — Describe the fleet in `repos.json`
+## Step 2 — Copy the two changes into the target pipeline
+
+Replace `.github/workflows/landingzone-infra-deploy.yml` in the target repo with
+`examples/landingzone-infra-deploy.yml`, or apply just the two blocks above to
+your copy. The rest of the file is untouched, including `terraformAction=apply`.
+
+Then check the target repo:
+
+- the file is on the **default branch** (`main`) — dispatch runs the version
+  that exists on the ref it is given;
+- `LZ_SPN_APP_ID` has a **federated credential for `refs/heads/main`**, not only
+  the feature-branch subject. If not, the run fails with `AADSTS70021:
+  No matching federated identity record found`. Check with
+  `az ad app federated-credential list --id <app-object-id> -o table`.
+
+---
+
+## Step 3 — Set the first target in `repos.json`
 
 ```json
 {
   "defaults": {
     "default_branch": "main",
-    "terraform_version": "1.9.8",
-    "max_parallel": 5,
-    "blob_container": "drift-reports"
+    "max_parallel": 1
   },
   "repositories": [
     {
-      "repo": "acme-corp/infra-network",
+      "repo": "acme-corp/landingzone-infra",
       "default_branch": "main",
       "enabled": true,
       "workflows": [
         {
-          "file": "terraform-drift-check.yml",
-          "label": "network",
-          "working_directory": "environments/{environment}",
-          "environments": ["dev", "staging", "prod"]
+          "file": "landingzone-infra-deploy.yml",
+          "label": "landingzone",
+          "targets": [
+            {
+              "dispatch_inputs": {
+                "environment": "dev",
+                "azresource": "containerapps",
+                "terraformAction": "plan"
+              }
+            }
+          ]
         }
       ]
     }
@@ -234,63 +205,42 @@ Then set `GH_TOKEN: ${{ steps.app-token.outputs.token }}` on the dispatch step.
 | Field | Required | Notes |
 | --- | --- | --- |
 | `repo` | yes | `owner/name` |
-| `default_branch` | no | falls back to `defaults.default_branch`; use `master` where needed |
+| `default_branch` | no | falls back to `defaults.default_branch` |
 | `enabled` | no | `false` pauses the repo without deleting config |
-| `workflows[].file` | yes | the **caller** file name in that repo, on the default branch |
-| `workflows[].label` | no | short name used in job titles and blob names |
-| `workflows[].working_directory` | no | Terraform dir; `{environment}` is substituted at run time |
-| `workflows[].terraform_version` | no | falls back to `defaults.terraform_version` |
-| `defaults.blob_container` | no | Azure container for reports, default `drift-reports`; passed to every caller |
-| `workflows[].blob_container` | no | overrides `defaults.blob_container` for this workflow |
-| `workflows[].environments` | yes | each becomes one matrix row |
+| `workflows[].file` | yes | the workflow that **already exists** in that repo |
+| `workflows[].label` | no | short name for job titles and summaries |
+| `workflows[].targets[]` | yes | one matrix row per target |
+| `targets[].dispatch_inputs` | yes | passed to `workflow_dispatch` verbatim; must include `environment` |
 | `workflows[].disabled` | no | `true` pauses just that workflow |
+| `defaults.max_parallel` | no | 1–10 concurrent dispatches |
 
-Everything is optional except `repo`, `workflows[].file` and
-`workflows[].environments`. Adding a repo or environment is a config change —
-no workflow edits.
-
----
-
-## Step 5 — Add the caller to every target repository
-
-Copy `examples/target-repo-caller.yml` to
-`.github/workflows/terraform-drift-check.yml` on the repo's default branch and
-change the `uses:` line to your orchestrator repo:
-
-```yaml
-uses: acme-corp/drift-check/.github/workflows/reusable-drift-check.yml@main
-```
-
-Requirements:
-
-- must live on the **default branch** (dispatch targets that ref);
-- must declare **every** `workflow_dispatch` input shown in the template, or
-  dispatch returns `422` (the helper retries once with a minimal payload and
-  warns);
-- the reusable workflow must be reachable — for private repos, allow access under
-  the orchestrator repo's Settings → Actions → General → Access.
-
-If cross-repo reuse is not possible, use
-`examples/standalone-drift-job.yml` instead. It integrates the same drift branch
-into an existing plan/apply pipeline: `drift_check_only: true` skips apply, runs
-the detailed-exitcode plan, filters and uploads; `false` behaves exactly as today.
+Every key in `dispatch_inputs` must be an input that workflow declares, and
+`choice` inputs only accept their listed options — otherwise dispatch returns
+`422`. The keys are sent as-is, so anything the target declares (`terraformAction`,
+`azresource`, a future `region`, …) works without touching this repo's scripts.
 
 ---
 
-## Step 6 — Run it
+## Step 4 — Run it
 
 ```bash
-# 1. Safe dry run: builds the matrix and logs payloads, no API calls
+# 1. Safe dry run: builds the matrix and prints the payload, no API calls
 gh workflow run drift-orchestrator.yml -f dry_run=true
 
-# 2. Real sweep, all repos
+# 2. Real sweep
 gh workflow run drift-orchestrator.yml
-
-# 3. One repository only
-gh workflow run drift-orchestrator.yml -f repository_filter='^acme-corp/infra-network$'
 ```
 
-Then verify a report landed:
+Or trigger the target directly, without the orchestrator, to see the report
+step work on its own:
+
+```bash
+gh workflow run landingzone-infra-deploy.yml -R acme-corp/landingzone-infra \
+  -f environment=dev -f azresource=containerapps -f terraformAction=plan
+```
+
+Force drift to test the happy path: change something in the portal that
+Terraform manages, re-run, expect a green run and a new blob:
 
 ```bash
 az storage blob list \
@@ -301,15 +251,35 @@ az storage blob list \
   -o table
 ```
 
-End-to-end smoke test on a single repo, without the orchestrator:
+---
 
-```bash
-gh workflow run terraform-drift-check.yml -R acme-corp/infra-network \
-  -f environment=dev -f drift_check_only=true
+## Scaling to all 12 targets
+
+Add rows, nothing else:
+
+```json
+"targets": [
+  { "dispatch_inputs": { "environment": "dev", "azresource": "containerapps", "terraformAction": "plan" } },
+  { "dispatch_inputs": { "environment": "dev", "azresource": "storage",      "terraformAction": "plan" } },
+  { "dispatch_inputs": { "environment": "tst", "azresource": "containerapps", "terraformAction": "plan" } }
+]
 ```
 
-Force drift to test the happy path: change something in the portal that
-Terraform manages, re-run, and expect a green target run plus a new blob.
+**One prerequisite:** with more than one target per workflow, the runs must be
+distinguishable. `workflow_dispatch` returns no run id, so the sweep currently
+matches "the single new `workflow_dispatch` run on `main`" — with two targets
+that becomes ambiguous and the dispatch job fails loudly (`Ambiguous dispatch`).
+Fix it by adding the discriminator to `run-name` in the target workflow:
+
+```yaml
+run-name: >-
+  ${{ github.event.inputs.environment }}-${{ github.event.inputs.azresource
+  }}-Infra-${{ github.event.inputs.terraformAction }} ${{ github.ref_name }}
+```
+
+Once that is in place the sweep can tell the 12 runs apart. Keep
+`defaults.max_parallel` low until you know how the shared self-hosted runner
+copes.
 
 ---
 
@@ -317,45 +287,40 @@ Terraform manages, re-run, and expect a green target run plus a new blob.
 
 | Symptom | Cause and fix |
 | --- | --- |
-| `AADSTS70021: No matching federated identity record found` | `sub` mismatch. Check the branch in `repos.json`, and whether the repo uses the immutable subject format (`repo:owner@id/repo@id:ref:refs/heads/...`). Inspect with `az ad app federated-credential list --id <app-object-id> -o table`. |
-| `AADSTS700016` / invalid client | `AZURE_CLIENT_ID` is the object ID instead of the application (client) ID. |
-| `403 AuthorizationPermissionMismatch` on upload | RBAC missing or still propagating. Confirm `Storage Blob Data Contributor` at **container** scope; wait a few minutes after assignment. |
-| Dispatch step: `404` | Caller file missing on the default branch, or the file name in `repos.json` is wrong. |
-| Dispatch step: `422` | The caller does not declare an input the orchestrator sends, or Actions is disabled on the repo. |
-| `Matrix vector ... does not contain any values` | Should be impossible (guarded by the `count` output); if it appears, every repo was filtered out or disabled. |
-| Target run red with `Terraform plan failed (exit 1)` | Real Terraform error — download the `terraform-plan-log-<env>` artifact. The sweep is red too, via the verify job. |
-| `Dispatched run not found` on the dispatch step | The caller does not declare the `correlation_id` input or has no `run-name`. Copy the current `examples/target-repo-caller.yml`. |
-| `Ambiguous dispatch` on the dispatch step | The same workflow was dispatched several times on one branch without correlation ids. Adopt the current caller template. |
-| Verify job: `Invalid blob container` | `defaults.blob_container` / `workflows[].blob_container` is not a valid Azure container name (3–63 lowercase letters, digits, hyphens). |
-| Verify job: `Drift check did not pass` | A target run ended red (or timed out, or was unverified). Follow the run link in the verify job summary. |
-| Green target run, no blob | Exit code was `0` (no drift) — check the run's step summary. |
-| Warning `exit code 2 without resource drift` | The plan reported changes but only outputs / data sources changed; the report is uploaded with null/empty arrays. |
+| Dispatch step `404` | File name wrong in `repos.json`, or the workflow is not on `default_branch`. |
+| Dispatch step `422` | A `dispatch_inputs` key is not declared by that workflow, or a `choice` value is not one of its options. |
+| `AADSTS70021: No matching federated identity record found` | The SPN has no federated credential for `refs/heads/main`. Add one (or dispatch from a branch it does trust). |
+| `Dispatched run not found` | Run did not appear within 180s (runner queue) or Actions is disabled. Re-run the sweep. |
+| `Ambiguous dispatch` | More than one new run appeared on that workflow — see "Scaling to all 12 targets" and add the discriminator to `run-name`. |
+| Target run red with `Terraform plan failed (exit 1)` | Real Terraform error — open the run and the `terraform-plan-log-*` artifact. The sweep is red too, via the verify job. |
+| Target run red before the plan | `terraform fmt -check -recursive` failed, or the backend/var-file is missing. Not drift: a real pipeline failure. |
+| Green target run, no blob | Exit code was `0` — no drift, nothing to upload. Check the run summary. |
+| `403 AuthorizationPermissionMismatch` on upload | The SPN cannot write to the container. Confirm it has `Storage Blob Data Contributor` on that storage account (this pipeline already creates containers there, so it normally does). |
+| `AuthorizationFailure` / container not found | The `sttfst` discovery query returned an empty `STORAGE_ACCOUNT_NAME`, or `DRIFT_CONTAINER` is not a valid container name (3–63 lowercase letters, digits, hyphens). |
 
 ---
 
 ## Security notes
 
-- **No static Azure credentials.** OIDC only; the storage account rejects shared
-  key access entirely, so `--auth-mode login` is the only way in.
-- **Least privilege.** `Storage Blob Data Contributor` at container scope; the
-  orchestrator's only extra permission is Actions dispatch.
+- **No static Azure credentials.** The target pipeline keeps its existing OIDC
+  (`azure/login` + federated credential); the orchestrator holds only a GitHub
+  token and never touches Azure.
+- **Least privilege.** The orchestrator's only permissions are Actions
+  dispatch/read and repo contents read. The report write reuses the identity the
+  plan already runs as.
 - **Plan JSON contains sensitive values.** `terraform show -json` emits
-  sensitive attributes in plaintext. The container is private, blobs expire
-  after 90 days, and versioning is enabled. Treat the container as sensitive and
-  restrict data-plane access.
+  sensitive attributes in plaintext. The container is private, but treat it as
+  sensitive and clean up old reports.
 - **Workflow permissions** default to `permissions: {}` in the orchestrator;
-  jobs opt in to `contents: read`, and only the target job needs `id-token: write`.
-- **Pinned actions.** Actions are pinned to major tags (`@v4`, `@v3`, `@v2`), the
-  usual baseline. For stricter supply-chain control, pin to commit SHAs.
-- **Secrets never touch logs.** Azure identifiers are not secrets, but the
-  storage account name is only ever read from secrets at runtime.
-- `persist-credentials: false` on every checkout.
+  each job opts in to `contents: read` / `actions: read` only.
+- **Pinned actions**, `persist-credentials: false` on every checkout, secrets
+  never echoed.
 
 ---
 
 ## Phase 1 boundary
 
-Included: scheduling, fan-out, dispatch, run correlation, verification of
-every dispatched run, drift detection, filtering, storage.
+Included: scheduling, fan-out, dispatch of existing pipelines, run
+verification, drift detection via exit code, `jq` filtering, blob storage.
 Not included (Phase 2): Event Grid subscription, AI analysis, Teams
-notification, historical comparison, drift dashboards.
+notification, historical comparison, dashboards.
