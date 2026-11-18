@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is gitignored.
+
+location             = "uksouth"
+resource_group_name  = "rg-tf-drift-detection"
+storage_account_name = "REPLACE-WITH-GLOBALLY-UNIQUE-NAME"
+container_name       = "drift-reports"
+retention_days       = 90
+app_display_name     = "gh-tf-drift-detection"
+
+# Keep in step with repos.json. For repositories on GitHub's immutable subject
+# format, set `subject` explicitly:
+#   subject = "repo:acme-corp@12345678/infra-network@87654321:ref:refs/heads/main"
+github_repositories = [
+  { name = "acme-corp/infra-network", branch = "main" },
+  { name = "acme-corp/infra-platform", branch = "main" },
+  { name = "acme-corp/infra-legacy", branch = "master" },
+]

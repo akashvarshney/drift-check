@@ -1,0 +1,61 @@
+name: Terraform Drift Check
+
+# -----------------------------------------------------------------------------
+# Copy this file to every Terraform repository as:
+#     .github/workflows/terraform-drift-check.yml
+#
+# It is the dispatch target the central orchestrator calls, and it must live on
+# the repository's DEFAULT branch. All real logic lives in the reusable
+# workflow in the orchestrator repo, so this file stays a thin adapter.
+#
+# Declare every input exactly as below - the orchestrator sends all of them,
+# and workflow_dispatch rejects (422) any input that is not declared here.
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to plan (dev / staging / prod)"
+        type: string
+        required: true
+      drift_check_only:
+        description: "Drift detection only - never applies"
+        type: boolean
+        default: true
+      working_directory:
+        description: "Terraform directory; {environment} is substituted"
+        type: string
+        default: "environments/{environment}"
+      terraform_version:
+        description: "Terraform CLI version"
+        type: string
+        default: "1.9.8"
+      workflow_label:
+        description: "Short label used in blob names"
+        type: string
+        default: ""
+      orchestrator_run_url:
+        description: "Set by the central orchestrator for traceability"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for Azure
+
+jobs:
+  drift-check:
+    # Replace with your own org/repo path if you use a fork or mirror.
+    uses: acme-corp/drift-check/.github/workflows/reusable-drift-check.yml@main
+    with:
+      environment: ${{ inputs.environment }}
+      drift_check_only: ${{ inputs.drift_check_only }}
+      working_directory: ${{ inputs.working_directory }}
+      terraform_version: ${{ inputs.terraform_version }}
+      workflow_label: ${{ inputs.workflow_label }}
+      orchestrator_run_url: ${{ inputs.orchestrator_run_url }}
+      blob_container: drift-reports
+      blob_prefix: drift-reports
+    # Picks up the org-level AZURE_* secrets without listing them here.
+    secrets: inherit

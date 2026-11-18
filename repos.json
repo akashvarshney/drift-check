@@ -1,0 +1,58 @@
+{
+  "$schema_version": 1,
+  "description": "Central inventory for the Phase 1 Terraform drift-detection sweep. The orchestrator flattens every (repository x workflow x environment) triple into one GitHub Actions matrix row. Add, remove or pause entries here only - no workflow YAML changes required.",
+  "defaults": {
+    "default_branch": "main",
+    "terraform_version": "1.9.8",
+    "max_parallel": 5,
+    "blob_container": "drift-reports"
+  },
+  "repositories": [
+    {
+      "repo": "acme-corp/infra-network",
+      "default_branch": "main",
+      "enabled": true,
+      "workflows": [
+        {
+          "file": "terraform-drift-check.yml",
+          "label": "network",
+          "working_directory": "environments/{environment}",
+          "environments": ["dev", "staging", "prod"]
+        }
+      ]
+    },
+    {
+      "repo": "acme-corp/infra-platform",
+      "default_branch": "main",
+      "enabled": true,
+      "workflows": [
+        {
+          "file": "terraform-drift-check.yml",
+          "label": "platform",
+          "working_directory": "stacks/platform/{environment}",
+          "environments": ["dev", "prod"]
+        },
+        {
+          "file": "terraform-drift-check.yml",
+          "label": "observability",
+          "working_directory": "stacks/observability/{environment}",
+          "terraform_version": "1.9.8",
+          "environments": ["dev", "staging", "prod"]
+        }
+      ]
+    },
+    {
+      "repo": "acme-corp/infra-legacy",
+      "default_branch": "master",
+      "enabled": false,
+      "workflows": [
+        {
+          "file": "terraform-drift-check.yml",
+          "label": "legacy",
+          "working_directory": ".",
+          "environments": ["prod"]
+        }
+      ]
+    }
+  ]
+}

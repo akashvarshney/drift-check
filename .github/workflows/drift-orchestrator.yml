@@ -1,0 +1,207 @@
+name: Terraform Drift Orchestrator
+
+# -----------------------------------------------------------------------------
+# Phase 1 orchestrator.
+#
+#   1. prepare  : validate repos.json and flatten it into a dispatch matrix
+#   2. dispatch : one parallel job per (repository x workflow x environment),
+#                 rate limited by strategy.max-parallel, calling the GitHub REST
+#                 API `workflow_dispatch` endpoint on the DEFAULT BRANCH.
+#
+# Authentication: a fine-grained PAT (or GitHub App installation token) stored
+# as the ORCHESTRATOR_TOKEN secret. GITHUB_TOKEN cannot dispatch workflows in
+# other repositories.
+# -----------------------------------------------------------------------------
+
+on:
+  schedule:
+    # 02:00 UTC daily.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      repository_filter:
+        description: "Optional regex - only dispatch repositories whose owner/name matches (e.g. ^acme-corp/infra-)"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Log the payloads without calling the GitHub API"
+        type: boolean
+        default: false
+
+# Deny by default; each job opts in to exactly what it needs.
+permissions: {}
+
+# A sweep can take a while. Never run two at once, and never cancel a half
+# finished sweep (that would leave dispatches unaccounted for).
+concurrency:
+  group: drift-orchestrator-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CONFIG_FILE: repos.json
+
+jobs:
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      count: ${{ steps.matrix.outputs.count }}
+      max_parallel: ${{ steps.matrix.outputs.max_parallel }}
+    steps:
+      - name: Check out configuration
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            repos.json
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: Validate repos.json
+        run: |
+          set -euo pipefail
+          jq -e . "$CONFIG_FILE" > /dev/null
+          jq -e '
+            (.repositories | type) == "array"
+            and (.repositories | length) > 0
+            and ([.repositories[] | select((.repo // "") == "")] | length) == 0
+            and ([.repositories[]
+                  | select(.enabled != false)
+                  | select(((.workflows // []) | length) == 0)] | length) == 0
+            and ([.repositories[] | (.workflows // [])[] | select((.file // "") == "")] | length) == 0
+          ' "$CONFIG_FILE" > /dev/null || {
+            echo "::error file=repos.json::repos.json failed validation - every entry needs a repo, and every enabled repo needs at least one workflow with a file."
+            exit 1
+          }
+
+      - name: Build dispatch matrix
+        id: matrix
+        env:
+          REPOSITORY_FILTER: ${{ inputs.repository_filter }}
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c --arg filter "${REPOSITORY_FILTER}" '
+            . as $root
+            | ($root.defaults.default_branch // "main") as $fallback_branch
+            | ($root.defaults.terraform_version // "1.9.8") as $fallback_tf
+            | [
+                $root.repositories[]?
+                | select(.enabled != false)
+                | . as $repo_entry
+                | ($repo_entry.workflows // [])[]
+                | select(.disabled != true)
+                | . as $workflow
+                | ($workflow.environments // [])[]
+                | select(type == "string" and length > 0)
+                | {
+                    repo: $repo_entry.repo,
+                    ref: ($repo_entry.default_branch // $fallback_branch),
+                    workflow_file: $workflow.file,
+                    workflow_label: ($workflow.label // ($workflow.file | gsub("\\.ya?ml$"; ""))),
+                    environment: .,
+                    working_directory: ($workflow.working_directory // "."),
+                    terraform_version: ($workflow.terraform_version // $fallback_tf)
+                  }
+              ]
+            # Dedupe on the label, not the file name: two workflows in the same
+            # repository can legitimately share a caller file name while
+            # targeting different Terraform directories.
+            | unique_by(.repo + "|" + .workflow_label + "|" + .workflow_file + "|" + .environment)
+            | map(select($filter == "" or (.repo | test($filter))))
+          ' "$CONFIG_FILE")
+
+          count=$(jq 'length' <<< "$matrix")
+
+          max_parallel=$(jq -r '.defaults.max_parallel // 5' "$CONFIG_FILE")
+          if ! [[ "$max_parallel" =~ ^[0-9]+$ ]]; then
+            echo "::warning::defaults.max_parallel is not an integer - falling back to 5"
+            max_parallel=5
+          fi
+          # Keep the fan-out polite: 1..10 concurrent dispatches.
+          if (( max_parallel < 1 )); then max_parallel=1; fi
+          if (( max_parallel > 10 )); then max_parallel=10; fi
+
+          {
+            echo "matrix=$matrix"
+            echo "count=$count"
+            echo "max_parallel=$max_parallel"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Drift sweep prepared"
+            echo
+            echo "- Config: \`$CONFIG_FILE\`"
+            echo "- Dispatch targets: **$count**"
+            echo "- Max parallel: **$max_parallel**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dispatch:
+    name: Dispatch ${{ matrix.repo }} / ${{ matrix.workflow_label }} / ${{ matrix.environment }}
+    needs: prepare
+    # An empty matrix is a hard error in Actions, so skip cleanly instead.
+    if: needs.prepare.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_parallel) }}
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out dispatch helper
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/
+          sparse-checkout-cone-mode: false
+
+      - name: Trigger workflow_dispatch
+        env:
+          # Fine-grained PAT with "Actions: write" on every target repository.
+          GH_TOKEN: ${{ secrets.ORCHESTRATOR_TOKEN }}
+          TARGET_REPO: ${{ matrix.repo }}
+          TARGET_REF: ${{ matrix.ref }}
+          WORKFLOW_FILE: ${{ matrix.workflow_file }}
+          WORKFLOW_LABEL: ${{ matrix.workflow_label }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          WORKING_DIRECTORY: ${{ matrix.working_directory }}
+          TERRAFORM_VERSION: ${{ matrix.terraform_version }}
+          ORCHESTRATOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: bash scripts/dispatch-drift-check.sh
+
+  report:
+    name: Sweep summary
+    needs: [prepare, dispatch]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Write summary
+        env:
+          TARGETS: ${{ needs.prepare.outputs.count }}
+          DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          ORCHESTRATOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Drift sweep result"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Dispatch targets | ${TARGETS:-0} |"
+            echo "| Dispatch job result | ${DISPATCH_RESULT:-skipped} |"
+            echo "| Orchestrator run | ${ORCHESTRATOR_RUN_URL} |"
+            echo
+            echo "Drift reports land in Azure Blob Storage under \`drift-reports/YYYY-MM-DD/\`."
+            echo "Target-repo run links are listed in each dispatch job log."
+          } >> "$GITHUB_STEP_SUMMARY"

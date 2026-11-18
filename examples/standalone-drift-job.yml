@@ -1,0 +1,270 @@
+name: Terraform - Network
+
+# -----------------------------------------------------------------------------
+# SELF-CONTAINED FALLBACK for repositories that cannot call a reusable workflow
+# in another repository (for example when the orchestrator repo is not
+# accessible to the target repo's Actions runner).
+#
+# It shows the full "modify the existing pipeline" pattern:
+#   drift_check_only = false -> normal plan + apply on main (unchanged behaviour)
+#   drift_check_only = true  -> plan -detailed-exitcode, no apply, jq filter,
+#                               upload to Azure Blob Storage
+#
+# Behaviour is identical to .github/workflows/reusable-drift-check.yml; keep the
+# two in sync if you change the report format.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - ".github/workflows/terraform-network.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to target"
+        type: string
+        required: true
+        default: dev
+      drift_check_only:
+        description: "Drift detection only - skip apply"
+        type: boolean
+        default: false
+      working_directory:
+        description: "Terraform directory; {environment} is substituted"
+        type: string
+        default: "environments/{environment}"
+      terraform_version:
+        description: "Terraform CLI version"
+        type: string
+        default: "1.9.8"
+      workflow_label:
+        description: "Short label used in blob names"
+        type: string
+        default: "network"
+      orchestrator_run_url:
+        description: "Set by the central orchestrator for traceability"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ARM_USE_OIDC: "true"
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TZ: UTC
+
+jobs:
+  plan:
+    name: Plan / ${{ inputs.environment || 'dev' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      exit_code: ${{ steps.plan.outputs.exit_code }}
+      drift_detected: ${{ steps.result.outputs.drift_detected }}
+      working_directory: ${{ steps.ctx.outputs.working_directory }}
+      repo_slug: ${{ steps.ctx.outputs.repo_slug }}
+      label: ${{ steps.ctx.outputs.label }}
+      run_date: ${{ steps.ctx.outputs.run_date }}
+      environment: ${{ steps.ctx.outputs.environment }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve run context
+        id: ctx
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+          INPUT_WORKING_DIRECTORY: ${{ inputs.working_directory || 'environments/{environment}' }}
+          INPUT_WORKFLOW_LABEL: ${{ inputs.workflow_label || 'network' }}
+        run: |
+          set -euo pipefail
+          environment="${INPUT_ENVIRONMENT}"
+          working_directory="${INPUT_WORKING_DIRECTORY}"
+          working_directory="${working_directory//\{environment\}/$environment}"
+          working_directory="${working_directory%/}"
+          if [ -z "$working_directory" ]; then working_directory="."; fi
+          if [ ! -d "$working_directory" ]; then
+            echo "::error title=Missing Terraform directory::'$working_directory' does not exist."
+            exit 1
+          fi
+          repo_slug=$(printf '%s' "$GITHUB_REPOSITORY" | sed -e 's|/|__|g' -e 's|[^A-Za-z0-9._-]|_|g')
+          label=$(printf '%s' "${INPUT_WORKFLOW_LABEL}" | sed -e 's|[^A-Za-z0-9._-]|_|g')
+          {
+            echo "environment=$environment"
+            echo "working_directory=$working_directory"
+            echo "repo_slug=$repo_slug"
+            echo "label=${label:-workflow}"
+            echo "run_date=$(date -u +%F)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version || '1.9.8' }}
+          terraform_wrapper: false
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Terraform init
+        working-directory: ${{ steps.ctx.outputs.working_directory }}
+        run: terraform init -input=false -no-color
+
+      # Drift path: detailed exit code, saved plan, execution deliberately kept
+      # alive so the exit code reaches the next step instead of failing the job.
+      - name: Terraform plan (drift check)
+        id: plan
+        if: inputs.drift_check_only == true
+        working-directory: ${{ steps.ctx.outputs.working_directory }}
+        run: |
+          set -uo pipefail
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan.binary 2>&1 \
+            | tee "$RUNNER_TEMP/terraform-plan.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+
+      # Normal deployment path - untouched behaviour for push and manual runs.
+      - name: Terraform plan (deploy)
+        id: plan_deploy
+        if: inputs.drift_check_only != true
+        working-directory: ${{ steps.ctx.outputs.working_directory }}
+        run: |
+          set -uo pipefail
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m -out=tfplan.binary
+          rc=$?
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Evaluate drift exit code
+        id: result
+        if: inputs.drift_check_only == true
+        env:
+          EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+        run: |
+          set -euo pipefail
+          case "$EXIT_CODE" in
+            0) echo "No drift detected." ;;
+            2)
+              echo "drift_detected=true" >> "$GITHUB_OUTPUT"
+              echo "Drift detected."
+              ;;
+            1)
+              echo "::error title=Terraform plan failed (exit 1)::Terraform reported an error."
+              exit 1
+              ;;
+            *)
+              echo "::error title=Unexpected terraform exit code::Received '$EXIT_CODE'."
+              exit 1
+              ;;
+          esac
+
+      # Only ever applies when this is NOT a drift check run.
+      - name: Terraform apply
+        if: inputs.drift_check_only != true && github.ref == 'refs/heads/main'
+        working-directory: ${{ steps.ctx.outputs.working_directory }}
+        run: terraform apply -input=false -no-color -auto-approve tfplan.binary
+
+      - name: Build drift report
+        id: report
+        if: steps.result.outputs.drift_detected == 'true'
+        working-directory: ${{ steps.ctx.outputs.working_directory }}
+        env:
+          ENVIRONMENT: ${{ steps.ctx.outputs.environment }}
+          LABEL: ${{ steps.ctx.outputs.label }}
+          ORCHESTRATOR_RUN_URL: ${{ inputs.orchestrator_run_url }}
+        run: |
+          set -euo pipefail
+          terraform show -json tfplan.binary > "$RUNNER_TEMP/tfplan.json"
+
+          cat > "$RUNNER_TEMP/drift-filter.jq" <<'JQ'
+          def is_drift:
+            (.change.actions | sort) as $actions
+            | ($actions != ["no-op"]) and ($actions != ["read"]);
+
+          {
+            metadata: {
+              repo: $repo,
+              workflow: $workflow,
+              environment: $environment,
+              timestamp: $timestamp,
+              run_url: $run_url,
+              run_id: $run_id,
+              run_attempt: $run_attempt,
+              commit_sha: $commit_sha,
+              working_directory: $working_directory,
+              orchestrator_run_url: $orchestrator_run_url,
+              detected_by: "terraform-drift-detection/phase-1"
+            },
+            summary: {
+              resource_changes_total: ((.resource_changes // []) | length),
+              drifted_resources: ([(.resource_changes // [])[] | select(is_drift)] | length),
+              out_of_band_drift: ([(.resource_drift // [])[] | select(is_drift)] | length)
+            },
+            resource_changes: [(.resource_changes // [])[] | select(is_drift)],
+            resource_drift: [(.resource_drift // [])[] | select(is_drift)]
+          }
+          JQ
+
+          jq -f "$RUNNER_TEMP/drift-filter.jq" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg workflow "$LABEL" \
+            --arg environment "$ENVIRONMENT" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --arg working_directory "${{ steps.ctx.outputs.working_directory }}" \
+            --arg orchestrator_run_url "${ORCHESTRATOR_RUN_URL:-}" \
+            "$RUNNER_TEMP/tfplan.json" > "$RUNNER_TEMP/drift-report.json"
+
+          echo "drifted_resources=$(jq -r '.summary.drifted_resources' "$RUNNER_TEMP/drift-report.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload drift report to Azure Blob Storage
+        if: steps.result.outputs.drift_detected == 'true'
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          ENVIRONMENT: ${{ steps.ctx.outputs.environment }}
+          REPO_SLUG: ${{ steps.ctx.outputs.repo_slug }}
+          LABEL: ${{ steps.ctx.outputs.label }}
+          RUN_DATE: ${{ steps.ctx.outputs.run_date }}
+        run: |
+          set -euo pipefail
+          blob_name="drift-reports/${RUN_DATE}/${REPO_SLUG}-${LABEL}-${ENVIRONMENT}.json"
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name drift-reports \
+            --name "$blob_name" \
+            --file "$RUNNER_TEMP/drift-report.json" \
+            --auth-mode login \
+            --overwrite \
+            --content-type "application/json" \
+            --only-show-errors
+          echo "Uploaded $blob_name"
+
+      - name: Upload plan log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-log
+          path: ${{ runner.temp }}/terraform-plan.log
+          retention-days: 7
+          if-no-files-found: ignore
